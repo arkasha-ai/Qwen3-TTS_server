@@ -1,7 +1,8 @@
 import os
+import shutil
 import time
 import torch
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -56,7 +57,7 @@ default_ref_audio = None
 default_ref_text = "Some call me nature, others call me mother nature."
 default_voice_prompt = None
 
-# Cache for voice data: {voice_name: {"processed_audio": path, "ref_text": str, "prompt": object}}
+# Cache for voice data: {"{voice}__{emotion}": {"processed_audio": path, "ref_text": str, "prompt": object}}
 voice_cache = {}
 
 
@@ -218,7 +219,60 @@ def audio_to_wav_bytes(audio_data: np.ndarray, sr: int) -> io.BytesIO:
     return buffer
 
 
-def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
+def find_voice_reference(voice: str, emotion: str = "neutral") -> Optional[str]:
+    """
+    Find reference audio file for a voice+emotion combo.
+    
+    Search order:
+    1. resources/{voice}/{emotion}.wav (new format)
+    2. resources/{voice}/neutral.wav (fallback emotion)
+    3. resources/{voice}.wav or resources/{voice}.* (legacy format)
+    """
+    # New format: resources/{voice}/{emotion}.wav
+    voice_dir = os.path.join(resources_dir, voice)
+    if os.path.isdir(voice_dir):
+        emotion_file = os.path.join(voice_dir, f"{emotion}.wav")
+        if os.path.isfile(emotion_file):
+            return emotion_file
+        # Fallback to neutral if requested emotion not found
+        if emotion != "neutral":
+            neutral_file = os.path.join(voice_dir, "neutral.wav")
+            if os.path.isfile(neutral_file):
+                logging.info(f"Emotion '{emotion}' not found for voice '{voice}', falling back to 'neutral'")
+                return neutral_file
+        # Try any file in the directory
+        for f in os.listdir(voice_dir):
+            if f.endswith('.wav'):
+                logging.info(f"Using first available emotion '{f}' for voice '{voice}'")
+                return os.path.join(voice_dir, f)
+
+    # Legacy format: resources/{voice}.wav or resources/{voice}.*
+    # First try WAV
+    legacy_wav = os.path.join(resources_dir, f"{voice}.wav")
+    if os.path.isfile(legacy_wav):
+        return legacy_wav
+
+    # Then try any matching file
+    for f in os.listdir(resources_dir):
+        name_without_ext = os.path.splitext(f)[0]
+        if name_without_ext == voice and os.path.isfile(os.path.join(resources_dir, f)):
+            file_path = os.path.join(resources_dir, f)
+            # Convert to WAV if needed
+            if not f.lower().endswith('.wav'):
+                wav_path = os.path.join(output_dir, 'ref_converted.wav')
+                convert_to_wav(file_path, wav_path)
+                return wav_path
+            return file_path
+
+    return None
+
+
+def get_cache_key(voice: str, emotion: str = "neutral") -> str:
+    """Build cache key from voice and emotion."""
+    return f"{voice}__{emotion}"
+
+
+def get_or_create_voice_cache(voice: str, reference_file: str, emotion: str = "neutral") -> dict:
     """
     Get cached voice data or create new cache entry.
     Caches: processed audio path, transcription, and voice clone prompt.
@@ -226,11 +280,13 @@ def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
     """
     global voice_cache
     
-    if voice in voice_cache:
-        logging.info(f"Using cached voice data for: {voice}")
-        return voice_cache[voice]
+    cache_key = get_cache_key(voice, emotion)
     
-    logging.info(f"Creating voice cache for: {voice}")
+    if cache_key in voice_cache:
+        logging.info(f"Using cached voice data for: {cache_key}")
+        return voice_cache[cache_key]
+    
+    logging.info(f"Creating voice cache for: {cache_key}")
     
     # Process reference audio (clip to 15s, remove silence)
     processed_ref, ref_text = process_reference_audio(reference_file)
@@ -243,7 +299,7 @@ def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
     )
     
     # Store in cache
-    voice_cache[voice] = {
+    voice_cache[cache_key] = {
         "processed_audio": processed_ref,
         "ref_text": ref_text,
         "prompt": voice_prompt,
@@ -251,8 +307,51 @@ def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
         "sample_rate": ref_sr,
     }
     
-    logging.info(f"Voice cache created for: {voice} (transcription: '{ref_text[:50]}...')")
-    return voice_cache[voice]
+    logging.info(f"Voice cache created for: {cache_key} (transcription: '{ref_text[:50]}...')")
+    return voice_cache[cache_key]
+
+
+def invalidate_voice_cache(voice: str, emotion: Optional[str] = None):
+    """Invalidate cache entries for a voice. If emotion is None, invalidate all emotions."""
+    global voice_cache
+    keys_to_delete = []
+    prefix = f"{voice}__"
+    if emotion:
+        key = get_cache_key(voice, emotion)
+        if key in voice_cache:
+            keys_to_delete.append(key)
+    else:
+        keys_to_delete = [k for k in voice_cache if k.startswith(prefix)]
+    for k in keys_to_delete:
+        del voice_cache[k]
+        logging.info(f"Cleared voice cache: {k}")
+
+
+def list_voices() -> dict[str, list[str]]:
+    """
+    List all available voices and their emotions.
+    Scans both new format (directories) and legacy format (flat files).
+    """
+    voices = {}
+    
+    for entry in os.listdir(resources_dir):
+        entry_path = os.path.join(resources_dir, entry)
+        
+        if os.path.isdir(entry_path):
+            # New format: directory with emotion files
+            emotions = []
+            for f in sorted(os.listdir(entry_path)):
+                if f.endswith('.wav'):
+                    emotions.append(os.path.splitext(f)[0])
+            if emotions:
+                voices[entry] = emotions
+        elif os.path.isfile(entry_path):
+            # Legacy format: flat file
+            name = os.path.splitext(entry)[0]
+            if name not in voices:
+                voices[name] = ["neutral"]
+    
+    return voices
 
 
 @app.on_event("startup")
@@ -261,17 +360,13 @@ async def startup_event():
     global default_ref_audio, default_voice_prompt
     
     # Check if we have a default voice file
-    default_files = [f for f in os.listdir(resources_dir) if f.startswith("default_en")]
-    if default_files:
-        default_ref_audio = f"{resources_dir}/{default_files[0]}"
-        if not default_ref_audio.endswith('.wav'):
-            wav_path = f"{resources_dir}/default_en.wav"
-            convert_to_wav(default_ref_audio, wav_path)
-            default_ref_audio = wav_path
+    ref = find_voice_reference("default_en")
+    if ref:
+        default_ref_audio = ref
     
     # Warmup with demo_speaker0 if available
-    demo_files = [f for f in os.listdir(resources_dir) if f.startswith("demo_speaker0")]
-    if demo_files:
+    demo_ref = find_voice_reference("demo_speaker0")
+    if demo_ref:
         logging.info("Warming up model with demo_speaker0...")
         test_text = "This is a test sentence generated by the Qwen3-TTS API."
         try:
@@ -280,6 +375,106 @@ async def startup_event():
         except Exception as e:
             logging.warning(f"Warmup failed: {e}")
 
+
+# ─── Voice management endpoints ───
+
+@app.get("/voices/")
+async def get_voices():
+    """List all available voices and their emotions."""
+    return {"voices": list_voices()}
+
+
+@app.post("/voices/{name}/emotions/{emotion}")
+async def upload_voice_emotion(name: str, emotion: str, file: UploadFile = File(...)):
+    """Upload a reference audio for a specific voice + emotion."""
+    try:
+        contents = await file.read()
+
+        allowed_extensions = {'wav', 'mp3', 'flac', 'ogg'}
+        max_file_size = 5 * 1024 * 1024
+
+        file_ext = file.filename.split('.')[-1].lower()
+        if file_ext not in allowed_extensions:
+            raise HTTPException(status_code=400, detail="Invalid file type. Allowed: wav, mp3, flac, ogg")
+
+        if len(contents) > max_file_size:
+            raise HTTPException(status_code=400, detail="File size over 5MB limit.")
+
+        temp_file = io.BytesIO(contents)
+        file_format = magic.from_buffer(temp_file.read(), mime=True)
+        if 'audio' not in file_format:
+            raise HTTPException(status_code=400, detail="Invalid file content.")
+
+        voice_dir = os.path.join(resources_dir, name)
+        os.makedirs(voice_dir, exist_ok=True)
+
+        # Save original
+        temp_path = os.path.join(voice_dir, f"{emotion}_orig.{file_ext}")
+        with open(temp_path, "wb") as f:
+            f.write(contents)
+
+        # Convert to WAV
+        wav_path = os.path.join(voice_dir, f"{emotion}.wav")
+        convert_to_wav(temp_path, wav_path)
+
+        # Remove temp original if different from wav
+        if temp_path != wav_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        invalidate_voice_cache(name, emotion)
+
+        return {"message": f"Voice '{name}' emotion '{emotion}' uploaded successfully."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error uploading voice emotion: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/voices/{name}")
+async def delete_voice(name: str):
+    """Delete a voice and all its emotions."""
+    voice_dir = os.path.join(resources_dir, name)
+    deleted = False
+
+    # Delete directory format
+    if os.path.isdir(voice_dir):
+        shutil.rmtree(voice_dir)
+        deleted = True
+
+    # Delete legacy flat files
+    for f in os.listdir(resources_dir):
+        if os.path.splitext(f)[0] == name and os.path.isfile(os.path.join(resources_dir, f)):
+            os.remove(os.path.join(resources_dir, f))
+            deleted = True
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Voice '{name}' not found.")
+
+    invalidate_voice_cache(name)
+    return {"message": f"Voice '{name}' deleted."}
+
+
+@app.delete("/voices/{name}/emotions/{emotion}")
+async def delete_voice_emotion(name: str, emotion: str):
+    """Delete a specific emotion from a voice."""
+    voice_dir = os.path.join(resources_dir, name)
+    emotion_file = os.path.join(voice_dir, f"{emotion}.wav")
+
+    if not os.path.isfile(emotion_file):
+        raise HTTPException(status_code=404, detail=f"Emotion '{emotion}' not found for voice '{name}'.")
+
+    os.remove(emotion_file)
+    invalidate_voice_cache(name, emotion)
+
+    # If directory is now empty, remove it
+    if os.path.isdir(voice_dir) and not os.listdir(voice_dir):
+        os.rmdir(voice_dir)
+
+    return {"message": f"Emotion '{emotion}' deleted from voice '{name}'."}
+
+
+# ─── Existing endpoints (updated) ───
 
 @app.get("/base_tts/")
 async def base_tts(text: str, speed: Optional[float] = 1.0):
@@ -308,18 +503,10 @@ async def change_voice(reference_speaker: str = Form(...), file: UploadFile = Fi
         with open(input_path, 'wb') as f:
             f.write(contents)
 
-        # Find the reference audio file
-        matching_files = [f for f in os.listdir(resources_dir) if f.startswith(str(reference_speaker))]
-        if not matching_files:
+        # Find reference audio
+        reference_file = find_voice_reference(reference_speaker)
+        if not reference_file:
             raise HTTPException(status_code=400, detail="No matching reference speaker found.")
-        
-        reference_file = f'{resources_dir}/{matching_files[0]}'
-        
-        # Convert reference file to WAV if it's not already
-        if not reference_file.lower().endswith('.wav'):
-            ref_wav_path = f'{output_dir}/ref_converted.wav'
-            convert_to_wav(reference_file, ref_wav_path)
-            reference_file = ref_wav_path
         
         # Transcribe the input audio
         text = transcribe_audio(input_path)
@@ -342,9 +529,14 @@ async def change_voice(reference_speaker: str = Form(...), file: UploadFile = Fi
 
 
 @app.post("/upload_audio/")
-async def upload_audio(audio_file_label: str = Form(...), file: UploadFile = File(...)):
+async def upload_audio(
+    audio_file_label: str = Form(...),
+    emotion: str = Form("neutral"),
+    file: UploadFile = File(...),
+):
     """
     Upload an audio file for later use as the reference audio.
+    Saves to resources/{label}/{emotion}.wav
     """
     try:
         contents = await file.read()
@@ -365,21 +557,27 @@ async def upload_audio(audio_file_label: str = Form(...), file: UploadFile = Fil
         if 'audio' not in file_format:
             return {"error": "Invalid file content."}
 
-        stored_file_name = f"{audio_file_label}.{file_ext}"
+        # New format: save to resources/{label}/{emotion}.wav
+        voice_dir = os.path.join(resources_dir, audio_file_label)
+        os.makedirs(voice_dir, exist_ok=True)
 
-        with open(f"{resources_dir}/{stored_file_name}", "wb") as f:
+        # Save original temporarily
+        temp_path = os.path.join(voice_dir, f"{emotion}_orig.{file_ext}")
+        with open(temp_path, "wb") as f:
             f.write(contents)
 
-        # Also create a WAV version
-        wav_path = f"{resources_dir}/{audio_file_label}.wav"
-        convert_to_wav(f"{resources_dir}/{stored_file_name}", wav_path)
-        
-        # Clear cached voice data if it exists (will be regenerated on next use)
-        if audio_file_label in voice_cache:
-            del voice_cache[audio_file_label]
-            logging.info(f"Cleared voice cache for: {audio_file_label}")
+        # Convert to WAV
+        wav_path = os.path.join(voice_dir, f"{emotion}.wav")
+        convert_to_wav(temp_path, wav_path)
 
-        return {"message": f"File {file.filename} uploaded successfully with label {audio_file_label}."}
+        # Remove temp if different
+        if temp_path != wav_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        # Clear cached voice data
+        invalidate_voice_cache(audio_file_label, emotion)
+
+        return {"message": f"File {file.filename} uploaded as {audio_file_label}/{emotion}."}
     except Exception as e:
         logging.error(f"Error in upload_audio: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -390,39 +588,33 @@ async def synthesize_speech(
         text: str,
         voice: str,
         speed: Optional[float] = 1.0,
+        emotion: str = "neutral",
 ):
     """
-    Synthesize speech from text using a specified voice and style.
+    Synthesize speech from text using a specified voice, emotion, and speed.
+    If the requested emotion is not available, falls back to 'neutral'.
     """
     start_time = time.time()
     try:
-        logging.info(f'Generating speech for voice: {voice}')
+        logging.info(f'Generating speech for voice: {voice}, emotion: {emotion}')
 
-        # First try to find a WAV version
-        matching_files = [f for f in os.listdir(resources_dir) if f.startswith(voice) and f.lower().endswith('.wav')]
-        
-        # If no WAV found, try other formats and convert
-        if not matching_files:
-            matching_files = [f for f in os.listdir(resources_dir) if f.startswith(voice)]
-            if not matching_files:
-                raise HTTPException(status_code=400, detail="No matching voice found.")
-            
-            # Convert to WAV
-            input_file = f'{resources_dir}/{matching_files[0]}'
-            wav_path = f'{output_dir}/ref_converted.wav'
-            convert_to_wav(input_file, wav_path)
-            reference_file = wav_path
-        else:
-            reference_file = f'{resources_dir}/{matching_files[0]}'
+        reference_file = find_voice_reference(voice, emotion)
+        if not reference_file:
+            raise HTTPException(status_code=400, detail="No matching voice found.")
 
-        # Get or create cached voice data (includes transcription and voice prompt)
-        if voice == "default_en" and default_ref_audio:
-            # Use default voice with known transcription
-            cache_data = get_or_create_voice_cache(voice, default_ref_audio)
+        # Determine actual emotion used (for cache key)
+        actual_emotion = emotion
+        voice_dir = os.path.join(resources_dir, voice)
+        if os.path.isdir(voice_dir):
+            if not os.path.isfile(os.path.join(voice_dir, f"{emotion}.wav")):
+                actual_emotion = "neutral"
         else:
-            cache_data = get_or_create_voice_cache(voice, reference_file)
+            actual_emotion = "neutral"
+
+        # Get or create cached voice data
+        cache_data = get_or_create_voice_cache(voice, reference_file, actual_emotion)
         
-        # Generate speech using cached voice prompt (no re-transcription needed)
+        # Generate speech using cached voice prompt
         audio_data, sr = generate_speech_with_prompt(text, cache_data["prompt"], speed)
         
         # Save output
