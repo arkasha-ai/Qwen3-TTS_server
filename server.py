@@ -71,27 +71,11 @@ logging.info("Qwen3-TTS model loaded successfully")
 # Suppress noisy configuration logging
 logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.WARNING)
 
-# torch.compile for faster inference (optional, graceful fallback)
-# mode="max-autotune": exhaustive CUDA kernel autotuning — best RTF for non-streaming
-# generation with dynamic (autoregressive) shapes.
-# NOTE: mode="reduce-overhead" is better for streaming fixed-window decode (CUDA graphs
-# internally), but suboptimal here since shapes vary across autoregressive steps.
-# NOTE: First inference after startup will be slow (~1-3 min) while JIT compiles and
-# autotunes. This is why warmup in startup_event is critical — it absorbs that cost.
+# torch.compile disabled — net negative for autoregressive generation.
+# Dynamic shapes per token cause constant recompilation; overhead > gains.
+# Measured: baseline RTF 1.32x → with compile 1.64x (worse). Keep disabled.
+# Re-enable only when switching to streaming decode with fixed windows (CUDA graphs).
 _COMPILE_APPLIED = False
-if torch.cuda.is_available():
-    logging.info("Applying torch.compile(mode='max-autotune') to talker model...")
-    try:
-        model.model.talker = torch.compile(
-            model.model.talker,
-            mode="max-autotune",
-            fullgraph=False,   # allow graph breaks; autoregresssive loop needs it
-            dynamic=True,      # handle varying seq lengths without recompilation
-        )
-        _COMPILE_APPLIED = True
-        logging.info("torch.compile applied successfully (max-autotune, dynamic=True)")
-    except Exception as e:
-        logging.warning(f"torch.compile failed (non-critical): {e}")
 
 # Initialize Whisper for transcription (Qwen3-TTS doesn't have built-in transcription)
 import whisper
