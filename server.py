@@ -64,8 +64,6 @@ model = Qwen3TTSModel.from_pretrained(
     "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
     device_map=device,
     dtype=torch.bfloat16,
-    # attn_implementation="flash_attention_2",  # requires flash-attn package
-    # enable if flash-attn is installed: pip install flash-attn --no-build-isolation
 )
 logging.info("Qwen3-TTS model loaded successfully")
 
@@ -708,40 +706,8 @@ async def startup_event():
     if ref:
         default_ref_audio = ref
 
-    # ── torch.compile warmup ──────────────────────────────────────────────────
-    # CRITICAL for mode="max-autotune": JIT compilation + kernel autotuning
-    # happens on the FIRST actual inference call and can take 1-3 minutes.
-    # Running a warmup inference here absorbs that cost at startup, not on the
-    # first user request. demo_speaker0.mp3 is always present in the Docker image.
-    warmup_voice = None
-    for candidate in ("demo_speaker0", "default_en"):
-        ref_file = find_voice_reference(candidate)
-        if ref_file:
-            warmup_voice = candidate
-            break
-
-    if warmup_voice:
-        warmup_text = "This is a warmup sentence for JIT compilation."
-        logging.info(
-            f"Warming up model with voice='{warmup_voice}' "
-            f"(torch.compile max-autotune — first call may take 1-3 min)..."
-        )
-        try:
-            # Run in executor so we don't block the event loop during warmup
-            loop = asyncio.get_event_loop()
-            ref_file = find_voice_reference(warmup_voice)
-            await loop.run_in_executor(
-                executor,
-                lambda: _sync_generate(warmup_voice, "neutral", warmup_text, 1.0),
-            )
-            logging.info("Warmup complete — torch.compile JIT graph is ready")
-        except Exception as e:
-            logging.warning(f"Warmup failed (non-critical): {e}")
-    else:
-        logging.warning(
-            "No warmup voice found (demo_speaker0 or default_en). "
-            "First inference request will be slow due to torch.compile JIT compilation."
-        )
+    # torch.compile is disabled — no warmup needed.
+    logging.info("Server ready (no warmup — torch.compile is disabled)")
 
 
 # ─── Voice management endpoints ───
