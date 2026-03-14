@@ -141,7 +141,7 @@ def init_qdrant_collection(vector_size: int):
 def _extract_embedding(voice_prompt) -> Optional[np.ndarray]:
     """
     Extract the speaker embedding (x-vector) from a voice_clone_prompt object.
-    Tries common attribute names; logs object structure on first call for debugging.
+    Handles list of VoiceClonePromptItem (Qwen3-TTS returns a list).
     """
     # Known candidate field names (Qwen3-TTS and common TTS frameworks)
     candidates = [
@@ -150,9 +150,13 @@ def _extract_embedding(voice_prompt) -> Optional[np.ndarray]:
         "embedding", "spk_emb", "speaker_emb", "prompt_embedding",
     ]
 
+    # Qwen3-TTS returns a list of VoiceClonePromptItem — unwrap first item
+    if isinstance(voice_prompt, (list, tuple)) and len(voice_prompt) > 0:
+        voice_prompt = voice_prompt[0]
+        logging.info(f"Unwrapped list prompt → {type(voice_prompt)}")
+
     obj_attrs = vars(voice_prompt) if hasattr(voice_prompt, '__dict__') else {}
 
-    # Log structure once for debugging
     logging.info(f"voice_clone_prompt type: {type(voice_prompt)}, attrs: {list(obj_attrs.keys())}")
 
     # --- dict-like prompt ---
