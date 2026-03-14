@@ -24,15 +24,18 @@ from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, Fi
 logging.basicConfig(level=logging.INFO)
 
 # ─── Concurrency helpers ───
+# threading.Lock вместо asyncio.Lock — безопасно на уровне модуля (Python 3.10+)
+import threading
 _voice_cache_locks: dict = {}
-_voice_cache_locks_mutex = asyncio.Lock()
+_voice_cache_locks_mutex = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=2)
 
 
-async def _get_voice_lock(cache_key: str) -> asyncio.Lock:
-    async with _voice_cache_locks_mutex:
+def _get_voice_lock_sync(cache_key: str) -> threading.Lock:
+    """Per-voice threading lock — вызывать из sync контекста (executor thread)."""
+    with _voice_cache_locks_mutex:
         if cache_key not in _voice_cache_locks:
-            _voice_cache_locks[cache_key] = asyncio.Lock()
+            _voice_cache_locks[cache_key] = threading.Lock()
         return _voice_cache_locks[cache_key]
 
 # ─── Qdrant configuration ───
@@ -608,7 +611,10 @@ def _sync_generate(voice: str, emotion: str, text: str, speed: float) -> tuple:
     reference_file = find_voice_reference(voice, emotion)
     if not reference_file:
         raise ValueError(f"No matching voice found: {voice}/{emotion}")
-    cache_data = get_or_create_voice_cache(voice, reference_file, emotion)
+    cache_key = get_cache_key(voice, emotion)
+    lock = _get_voice_lock_sync(cache_key)
+    with lock:
+        cache_data = get_or_create_voice_cache(voice, reference_file, emotion)
     return generate_speech_with_prompt(text, cache_data["prompt"], speed)
 
 
@@ -617,7 +623,10 @@ def _sync_generate_voice_change(reference_speaker: str, text: str) -> tuple:
     reference_file = find_voice_reference(reference_speaker)
     if not reference_file:
         raise ValueError("No matching reference speaker found.")
-    cache_data = get_or_create_voice_cache(reference_speaker, reference_file)
+    cache_key = get_cache_key(reference_speaker, "neutral")
+    lock = _get_voice_lock_sync(cache_key)
+    with lock:
+        cache_data = get_or_create_voice_cache(reference_speaker, reference_file)
     return generate_speech_with_prompt(text, cache_data["prompt"])
 
 
@@ -697,9 +706,9 @@ async def startup_event():
     """Warmup the model on startup and launch background tasks."""
     global default_ref_audio, default_voice_prompt
 
-    # Launch GPU keepalive as a background task (fire-and-forget)
+    # GPU keepalive — предотвращает даунклокинг GPU после idle
     if torch.cuda.is_available():
-        asyncio.create_task(_gpu_keepalive_task())
+        asyncio.ensure_future(_gpu_keepalive_task())
 
     # Check if we have a default voice file
     ref = find_voice_reference("default_en")
@@ -839,7 +848,7 @@ async def change_voice(reference_speaker: str = Form(...), file: UploadFile = Fi
         contents = await file.read()
 
         # Transcribe input audio (blocking — run in executor)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         input_buf = io.BytesIO(contents)
         input_path = f'{output_dir}/input_audio_{id(input_buf)}.wav'
         with open(input_path, 'wb') as f:
@@ -853,14 +862,11 @@ async def change_voice(reference_speaker: str = Form(...), file: UploadFile = Fi
                 pass
         logging.info(f'Transcribed input audio: {text}')
 
-        # Generate with the new voice (blocking ML — run in executor, per-voice lock)
-        cache_key = get_cache_key(reference_speaker, "neutral")
-        voice_lock = await _get_voice_lock(cache_key)
-        async with voice_lock:
-            audio_data, sr = await loop.run_in_executor(
-                executor,
-                lambda: _sync_generate_voice_change(reference_speaker, text),
-            )
+        # Generate with the new voice (lock is handled inside _sync_generate_voice_change)
+        audio_data, sr = await loop.run_in_executor(
+            executor,
+            lambda: _sync_generate_voice_change(reference_speaker, text),
+        )
 
         buf = audio_to_wav_bytes(audio_data, sr)
         return StreamingResponse(buf, media_type="audio/wav")
@@ -958,15 +964,12 @@ async def synthesize_speech(
         else:
             actual_emotion = "neutral"
 
-        # Acquire per-voice lock, then run blocking ML in executor
-        cache_key = get_cache_key(voice, actual_emotion)
-        voice_lock = await _get_voice_lock(cache_key)
-        loop = asyncio.get_event_loop()
-        async with voice_lock:
-            audio_data, sr = await loop.run_in_executor(
-                executor,
-                lambda: _sync_generate(voice, actual_emotion, text, speed),
-            )
+        # Lock is handled inside _sync_generate (threading.Lock, safe in executor)
+        loop = asyncio.get_running_loop()
+        audio_data, sr = await loop.run_in_executor(
+            executor,
+            lambda: _sync_generate(voice, actual_emotion, text, speed),
+        )
 
         buf = audio_to_wav_bytes(audio_data, sr)
         result = StreamingResponse(buf, media_type="audio/wav")
