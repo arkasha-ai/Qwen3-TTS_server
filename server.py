@@ -1,7 +1,10 @@
 import os
+import re
 import shutil
 import time
+import asyncio
 import torch
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -13,11 +16,24 @@ import magic
 import logging
 import numpy as np
 import uuid
+from cachetools import LRUCache
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 
 logging.basicConfig(level=logging.INFO)
+
+# ─── Concurrency helpers ───
+_voice_cache_locks: dict = {}
+_voice_cache_locks_mutex = asyncio.Lock()
+executor = ThreadPoolExecutor(max_workers=2)
+
+
+async def _get_voice_lock(cache_key: str) -> asyncio.Lock:
+    async with _voice_cache_locks_mutex:
+        if cache_key not in _voice_cache_locks:
+            _voice_cache_locks[cache_key] = asyncio.Lock()
+        return _voice_cache_locks[cache_key]
 
 # ─── Qdrant configuration ───
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
@@ -33,7 +49,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # wildcard origin + credentials=True is forbidden by spec
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -48,8 +64,21 @@ model = Qwen3TTSModel.from_pretrained(
     "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
     device_map=device,
     dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
 )
 logging.info("Qwen3-TTS model loaded successfully")
+
+# Suppress noisy configuration logging
+logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.WARNING)
+
+# torch.compile for faster inference (optional, graceful fallback)
+if torch.cuda.is_available():
+    logging.info("Applying torch.compile to talker model...")
+    try:
+        model.model.talker = torch.compile(model.model.talker, mode="reduce-overhead")
+        logging.info("torch.compile applied successfully")
+    except Exception as e:
+        logging.warning(f"torch.compile failed (non-critical): {e}")
 
 # Initialize Whisper for transcription (Qwen3-TTS doesn't have built-in transcription)
 import whisper
@@ -70,7 +99,7 @@ default_ref_text = "Some call me nature, others call me mother nature."
 default_voice_prompt = None
 
 # Cache for voice data: {"{voice}__{emotion}": {"processed_audio": path, "ref_text": str, "prompt": object}}
-voice_cache = {}
+voice_cache = LRUCache(maxsize=50)
 
 
 # ─── Qdrant helpers ───
@@ -119,6 +148,7 @@ def _extract_embedding(voice_prompt) -> Optional[np.ndarray]:
     """
     # Known candidate field names (Qwen3-TTS and common TTS frameworks)
     candidates = [
+        "ref_spk_embedding",  # Qwen3-TTS VoiceClonePromptItem — check first!
         "x_vector", "speaker_embedding", "spk_embedding", "xvector",
         "embedding", "spk_emb", "speaker_emb", "prompt_embedding",
     ]
@@ -563,6 +593,34 @@ def get_or_create_voice_cache(voice: str, reference_file: str, emotion: str = "n
     return voice_cache[cache_key]
 
 
+def validate_path_component(name: str, field: str = "name") -> str:
+    """Reject path traversal / injection in voice/emotion params."""
+    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field}: alphanumeric, _ or - only (max 64 chars)",
+        )
+    return name
+
+
+def _sync_generate(voice: str, emotion: str, text: str, speed: float) -> tuple:
+    """Synchronous wrapper for ML inference — runs in ThreadPoolExecutor."""
+    reference_file = find_voice_reference(voice, emotion)
+    if not reference_file:
+        raise ValueError(f"No matching voice found: {voice}/{emotion}")
+    cache_data = get_or_create_voice_cache(voice, reference_file, emotion)
+    return generate_speech_with_prompt(text, cache_data["prompt"], speed)
+
+
+def _sync_generate_voice_change(reference_speaker: str, text: str) -> tuple:
+    """Synchronous wrapper for voice-change inference — runs in ThreadPoolExecutor."""
+    reference_file = find_voice_reference(reference_speaker)
+    if not reference_file:
+        raise ValueError("No matching reference speaker found.")
+    cache_data = get_or_create_voice_cache(reference_speaker, reference_file)
+    return generate_speech_with_prompt(text, cache_data["prompt"])
+
+
 def invalidate_voice_cache(voice: str, emotion: Optional[str] = None):
     """Invalidate cache entries for a voice. If emotion is None, invalidate all emotions."""
     global voice_cache
@@ -642,6 +700,8 @@ async def get_voices():
 @app.post("/voices/{name}/emotions/{emotion}")
 async def upload_voice_emotion(name: str, emotion: str, file: UploadFile = File(...)):
     """Upload a reference audio for a specific voice + emotion."""
+    name = validate_path_component(name, "voice name")
+    emotion = validate_path_component(emotion, "emotion")
     try:
         contents = await file.read()
 
@@ -689,6 +749,7 @@ async def upload_voice_emotion(name: str, emotion: str, file: UploadFile = File(
 @app.delete("/voices/{name}")
 async def delete_voice(name: str):
     """Delete a voice and all its emotions."""
+    name = validate_path_component(name, "voice name")
     voice_dir = os.path.join(resources_dir, name)
     deleted = False
 
@@ -713,6 +774,8 @@ async def delete_voice(name: str):
 @app.delete("/voices/{name}/emotions/{emotion}")
 async def delete_voice_emotion(name: str, emotion: str):
     """Delete a specific emotion from a voice."""
+    name = validate_path_component(name, "voice name")
+    emotion = validate_path_component(emotion, "emotion")
     voice_dir = os.path.join(resources_dir, name)
     emotion_file = os.path.join(voice_dir, f"{emotion}.wav")
 
@@ -748,36 +811,40 @@ async def change_voice(reference_speaker: str = Form(...), file: UploadFile = Fi
     """
     Change the voice of an existing audio file.
     """
+    reference_speaker = validate_path_component(reference_speaker, "reference_speaker")
     try:
         logging.info(f'Changing voice to {reference_speaker}...')
 
         contents = await file.read()
-        
-        # Save the input audio temporarily
-        input_path = f'{output_dir}/input_audio.wav'
+
+        # Transcribe input audio (blocking — run in executor)
+        loop = asyncio.get_event_loop()
+        input_buf = io.BytesIO(contents)
+        input_path = f'{output_dir}/input_audio_{id(input_buf)}.wav'
         with open(input_path, 'wb') as f:
             f.write(contents)
-
-        # Find reference audio
-        reference_file = find_voice_reference(reference_speaker)
-        if not reference_file:
-            raise HTTPException(status_code=400, detail="No matching reference speaker found.")
-        
-        # Transcribe the input audio
-        text = transcribe_audio(input_path)
+        try:
+            text = await loop.run_in_executor(executor, lambda: transcribe_audio(input_path))
+        finally:
+            try:
+                os.remove(input_path)
+            except OSError:
+                pass
         logging.info(f'Transcribed input audio: {text}')
-        
-        # Get or create cached voice data for the reference speaker
-        cache_data = get_or_create_voice_cache(reference_speaker, reference_file)
-        
-        # Generate with the new voice using cached prompt
-        audio_data, sr = generate_speech_with_prompt(text, cache_data["prompt"])
-        
-        # Save output
-        save_path = f'{output_dir}/output_converted.wav'
-        sf.write(save_path, audio_data, sr)
 
-        return StreamingResponse(open(save_path, 'rb'), media_type="audio/wav")
+        # Generate with the new voice (blocking ML — run in executor, per-voice lock)
+        cache_key = get_cache_key(reference_speaker, "neutral")
+        voice_lock = await _get_voice_lock(cache_key)
+        async with voice_lock:
+            audio_data, sr = await loop.run_in_executor(
+                executor,
+                lambda: _sync_generate_voice_change(reference_speaker, text),
+            )
+
+        buf = audio_to_wav_bytes(audio_data, sr)
+        return StreamingResponse(buf, media_type="audio/wav")
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error in change_voice: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -793,6 +860,8 @@ async def upload_audio(
     Upload an audio file for later use as the reference audio.
     Saves to resources/{label}/{emotion}.wav
     """
+    audio_file_label = validate_path_component(audio_file_label, "audio_file_label")
+    emotion = validate_path_component(emotion, "emotion")
     try:
         contents = await file.read()
 
@@ -801,16 +870,16 @@ async def upload_audio(
 
         file_ext = file.filename.split('.')[-1].lower()
         if file_ext not in allowed_extensions:
-            return {"error": "Invalid file type. Allowed types are: wav, mp3, flac, ogg"}
+            raise HTTPException(status_code=400, detail="Invalid file type. Allowed: wav, mp3, flac, ogg")
 
         if len(contents) > max_file_size:
-            return {"error": "File size is over limit. Max size is 5MB."}
+            raise HTTPException(status_code=400, detail="File size is over limit. Max size is 5MB.")
 
         temp_file = io.BytesIO(contents)
         file_format = magic.from_buffer(temp_file.read(), mime=True)
 
         if 'audio' not in file_format:
-            return {"error": "Invalid file content."}
+            raise HTTPException(status_code=400, detail="Invalid file content.")
 
         # New format: save to resources/{label}/{emotion}.wav
         voice_dir = os.path.join(resources_dir, audio_file_label)
@@ -849,6 +918,8 @@ async def synthesize_speech(
     Synthesize speech from text using a specified voice, emotion, and speed.
     If the requested emotion is not available, falls back to 'neutral'.
     """
+    voice = validate_path_component(voice, "voice")
+    emotion = validate_path_component(emotion, "emotion")
     start_time = time.time()
     try:
         logging.info(f'Generating speech for voice: {voice}, emotion: {emotion}')
@@ -866,31 +937,26 @@ async def synthesize_speech(
         else:
             actual_emotion = "neutral"
 
-        # Get or create cached voice data
-        cache_data = get_or_create_voice_cache(voice, reference_file, actual_emotion)
-        
-        # Generate speech using cached voice prompt
-        audio_data, sr = generate_speech_with_prompt(text, cache_data["prompt"], speed)
-        
-        # Save output
-        save_path = f'{output_dir}/output_synthesized.wav'
-        sf.write(save_path, audio_data, sr)
+        # Acquire per-voice lock, then run blocking ML in executor
+        cache_key = get_cache_key(voice, actual_emotion)
+        voice_lock = await _get_voice_lock(cache_key)
+        loop = asyncio.get_event_loop()
+        async with voice_lock:
+            audio_data, sr = await loop.run_in_executor(
+                executor,
+                lambda: _sync_generate(voice, actual_emotion, text, speed),
+            )
 
-        result = StreamingResponse(open(save_path, 'rb'), media_type="audio/wav")
+        buf = audio_to_wav_bytes(audio_data, sr)
+        result = StreamingResponse(buf, media_type="audio/wav")
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-
+        elapsed_time = time.time() - start_time
         result.headers["X-Elapsed-Time"] = str(elapsed_time)
         result.headers["X-Device-Used"] = device
 
-        # Add CORS headers
-        result.headers["Access-Control-Allow-Origin"] = "*"
-        result.headers["Access-Control-Allow-Credentials"] = "true"
-        result.headers["Access-Control-Allow-Headers"] = "Origin, Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token, locale"
-        result.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error in synthesize_speech: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
