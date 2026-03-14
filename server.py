@@ -64,7 +64,8 @@ model = Qwen3TTSModel.from_pretrained(
     "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
     device_map=device,
     dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
+    # attn_implementation="flash_attention_2",  # requires flash-attn package
+    # enable if flash-attn is installed: pip install flash-attn --no-build-isolation
 )
 logging.info("Qwen3-TTS model loaded successfully")
 
