@@ -32,6 +32,9 @@ env/
 *.swp
 *.swo
 
+# Environment
+.env
+
 # Project specific
 outputs/
 resources/*.wav

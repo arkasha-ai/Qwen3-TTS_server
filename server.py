@@ -12,8 +12,20 @@ import io
 import magic
 import logging
 import numpy as np
+import uuid
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 
 logging.basicConfig(level=logging.INFO)
+
+# ─── Qdrant configuration ───
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "voice_embeddings")
+
+qdrant_client: Optional[QdrantClient] = None
+_qdrant_collection_initialized = False
 
 app = FastAPI()
 
@@ -59,6 +71,208 @@ default_voice_prompt = None
 
 # Cache for voice data: {"{voice}__{emotion}": {"processed_audio": path, "ref_text": str, "prompt": object}}
 voice_cache = {}
+
+
+# ─── Qdrant helpers ───
+
+def _connect_qdrant():
+    """Lazily connect to Qdrant. Tolerates Qdrant being unavailable."""
+    global qdrant_client
+    if qdrant_client is not None:
+        return qdrant_client
+    try:
+        qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=5)
+        logging.info(f"Connected to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
+        return qdrant_client
+    except Exception as e:
+        logging.warning(f"Could not connect to Qdrant: {e}. Voice embeddings will NOT be persisted.")
+        return None
+
+
+def init_qdrant_collection(vector_size: int):
+    """Create the Qdrant collection if it doesn't exist."""
+    global _qdrant_collection_initialized
+    if _qdrant_collection_initialized:
+        return
+    client = _connect_qdrant()
+    if client is None:
+        return
+    try:
+        collections = [c.name for c in client.get_collections().collections]
+        if QDRANT_COLLECTION not in collections:
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+            )
+            logging.info(f"Created Qdrant collection '{QDRANT_COLLECTION}' with vector_size={vector_size}")
+        else:
+            logging.info(f"Qdrant collection '{QDRANT_COLLECTION}' already exists")
+        _qdrant_collection_initialized = True
+    except Exception as e:
+        logging.warning(f"Qdrant init_collection failed: {e}")
+
+
+def _extract_embedding(voice_prompt) -> Optional[np.ndarray]:
+    """
+    Extract the speaker embedding (x-vector) from a voice_clone_prompt object.
+    Tries common attribute names; logs object structure on first call for debugging.
+    """
+    # Known candidate field names (Qwen3-TTS and common TTS frameworks)
+    candidates = [
+        "x_vector", "speaker_embedding", "spk_embedding", "xvector",
+        "embedding", "spk_emb", "speaker_emb", "prompt_embedding",
+    ]
+
+    obj_attrs = vars(voice_prompt) if hasattr(voice_prompt, '__dict__') else {}
+
+    # Log structure once for debugging
+    logging.info(f"voice_clone_prompt type: {type(voice_prompt)}, attrs: {list(obj_attrs.keys())}")
+
+    # --- dict-like prompt ---
+    if isinstance(voice_prompt, dict):
+        for name in candidates:
+            if name in voice_prompt:
+                val = voice_prompt[name]
+                return _to_numpy(val)
+        # Fallback: first tensor/ndarray value
+        for k, v in voice_prompt.items():
+            arr = _to_numpy(v)
+            if arr is not None and arr.ndim == 1:
+                logging.info(f"Using dict key '{k}' as embedding (shape {arr.shape})")
+                return arr
+
+    # --- object with attributes ---
+    for name in candidates:
+        val = getattr(voice_prompt, name, None)
+        if val is not None:
+            arr = _to_numpy(val)
+            if arr is not None:
+                logging.info(f"Using attribute '{name}' as embedding (shape {arr.shape})")
+                return arr
+
+    # Fallback: scan all attrs for a 1-D tensor/ndarray
+    for name, val in obj_attrs.items():
+        arr = _to_numpy(val)
+        if arr is not None and arr.ndim == 1 and arr.shape[0] > 32:
+            logging.info(f"Fallback: using attribute '{name}' as embedding (shape {arr.shape})")
+            return arr
+
+    logging.warning("Could not extract embedding from voice_clone_prompt")
+    return None
+
+
+def _to_numpy(val) -> Optional[np.ndarray]:
+    """Convert a tensor or ndarray to a flat numpy float32 array."""
+    if val is None:
+        return None
+    if isinstance(val, np.ndarray):
+        return val.flatten().astype(np.float32)
+    if isinstance(val, torch.Tensor):
+        return val.detach().cpu().float().numpy().flatten()
+    return None
+
+
+def save_voice_to_qdrant(voice: str, emotion: str, x_vector: np.ndarray, ref_text: str):
+    """Save or update a voice embedding in Qdrant."""
+    client = _connect_qdrant()
+    if client is None:
+        return
+    init_qdrant_collection(len(x_vector))
+    try:
+        # Delete existing point with same voice+emotion (upsert by payload match)
+        client.delete(
+            collection_name=QDRANT_COLLECTION,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(key="voice", match=MatchValue(value=voice)),
+                    FieldCondition(key="emotion", match=MatchValue(value=emotion)),
+                ]
+            ),
+        )
+        point_id = str(uuid.uuid4())
+        client.upsert(
+            collection_name=QDRANT_COLLECTION,
+            points=[
+                PointStruct(
+                    id=point_id,
+                    vector=x_vector.tolist(),
+                    payload={"voice": voice, "emotion": emotion, "ref_text": ref_text},
+                )
+            ],
+        )
+        logging.info(f"Saved voice embedding to Qdrant: {voice}/{emotion} (dim={len(x_vector)})")
+    except Exception as e:
+        logging.warning(f"Failed to save embedding to Qdrant: {e}")
+
+
+def load_voice_from_qdrant(voice: str, emotion: str) -> Optional[dict]:
+    """
+    Load a voice embedding from Qdrant.
+    Returns {"x_vector": np.ndarray, "ref_text": str} or None.
+    """
+    client = _connect_qdrant()
+    if client is None:
+        return None
+    try:
+        results = client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="voice", match=MatchValue(value=voice)),
+                    FieldCondition(key="emotion", match=MatchValue(value=emotion)),
+                ]
+            ),
+            limit=1,
+            with_vectors=True,
+        )
+        points = results[0]
+        if points:
+            point = points[0]
+            return {
+                "x_vector": np.array(point.vector, dtype=np.float32),
+                "ref_text": point.payload.get("ref_text", ""),
+            }
+    except Exception as e:
+        logging.warning(f"Failed to load embedding from Qdrant: {e}")
+    return None
+
+
+def delete_voice_from_qdrant(voice: str, emotion: Optional[str] = None):
+    """Delete voice embedding(s) from Qdrant."""
+    client = _connect_qdrant()
+    if client is None:
+        return
+    try:
+        conditions = [FieldCondition(key="voice", match=MatchValue(value=voice))]
+        if emotion:
+            conditions.append(FieldCondition(key="emotion", match=MatchValue(value=emotion)))
+        client.delete(
+            collection_name=QDRANT_COLLECTION,
+            points_selector=Filter(must=conditions),
+        )
+        logging.info(f"Deleted voice embedding from Qdrant: {voice}/{emotion or '*'}")
+    except Exception as e:
+        logging.warning(f"Failed to delete from Qdrant: {e}")
+
+
+def _rebuild_prompt_from_embedding(x_vector: np.ndarray, ref_text: str):
+    """
+    Attempt to rebuild a voice_clone_prompt from a stored x_vector.
+    This is model-specific — if the model exposes a way to build prompts
+    from raw embeddings, we use it. Otherwise we wrap it in the expected structure.
+    """
+    # Try model-level reconstruction if available
+    if hasattr(model, 'create_prompt_from_embedding'):
+        tensor = torch.from_numpy(x_vector).to(device)
+        return model.create_prompt_from_embedding(tensor, ref_text)
+
+    # Generic fallback: wrap in a dict matching common prompt structures
+    tensor = torch.from_numpy(x_vector).to(dtype=torch.bfloat16, device=device)
+
+    # Try to match the structure of what create_voice_clone_prompt returns
+    # by creating a dummy prompt and replacing its embedding
+    logging.info("Rebuilding prompt by substituting stored embedding into fresh prompt structure")
+    return {"x_vector": tensor, "ref_text": ref_text, "_restored_from_qdrant": True}
 
 
 def convert_to_wav(input_path: str, output_path: str):
@@ -275,17 +489,50 @@ def get_cache_key(voice: str, emotion: str = "neutral") -> str:
 def get_or_create_voice_cache(voice: str, reference_file: str, emotion: str = "neutral") -> dict:
     """
     Get cached voice data or create new cache entry.
-    Caches: processed audio path, transcription, and voice clone prompt.
-    This avoids repeated Whisper transcription on every request.
+    
+    Lookup order:
+    1. In-memory cache (fastest)
+    2. Qdrant persistent storage (restore embedding → rebuild prompt)
+    3. Create from reference audio file (slowest — runs Whisper + prompt creation)
     """
     global voice_cache
     
     cache_key = get_cache_key(voice, emotion)
     
+    # 1. In-memory cache
     if cache_key in voice_cache:
-        logging.info(f"Using cached voice data for: {cache_key}")
+        logging.info(f"Using in-memory cached voice data for: {cache_key}")
         return voice_cache[cache_key]
     
+    # 2. Try Qdrant
+    qdrant_data = load_voice_from_qdrant(voice, emotion)
+    if qdrant_data is not None:
+        logging.info(f"Restoring voice from Qdrant for: {cache_key}")
+        x_vector = qdrant_data["x_vector"]
+        ref_text = qdrant_data["ref_text"]
+
+        # We still need the reference audio to rebuild a proper prompt
+        # because most TTS models need the full prompt object, not just x_vector.
+        # Try to rebuild from audio + use the stored ref_text (skip Whisper).
+        try:
+            ref_audio_data, ref_sr = sf.read(reference_file)
+            voice_prompt = model.create_voice_clone_prompt(
+                ref_audio=(ref_audio_data, ref_sr),
+                ref_text=ref_text,  # Use stored text — skips Whisper!
+            )
+            voice_cache[cache_key] = {
+                "processed_audio": reference_file,
+                "ref_text": ref_text,
+                "prompt": voice_prompt,
+                "audio_data": ref_audio_data,
+                "sample_rate": ref_sr,
+            }
+            logging.info(f"Voice restored from Qdrant (skipped Whisper): {cache_key}")
+            return voice_cache[cache_key]
+        except Exception as e:
+            logging.warning(f"Failed to restore prompt from Qdrant data: {e}, falling back to full creation")
+    
+    # 3. Full creation from reference file
     logging.info(f"Creating voice cache for: {cache_key}")
     
     # Process reference audio (clip to 15s, remove silence)
@@ -298,7 +545,12 @@ def get_or_create_voice_cache(voice: str, reference_file: str, emotion: str = "n
         ref_text=ref_text,
     )
     
-    # Store in cache
+    # Extract and persist embedding to Qdrant
+    x_vector = _extract_embedding(voice_prompt)
+    if x_vector is not None:
+        save_voice_to_qdrant(voice, emotion, x_vector, ref_text)
+    
+    # Store in memory cache
     voice_cache[cache_key] = {
         "processed_audio": processed_ref,
         "ref_text": ref_text,
@@ -325,6 +577,9 @@ def invalidate_voice_cache(voice: str, emotion: Optional[str] = None):
     for k in keys_to_delete:
         del voice_cache[k]
         logging.info(f"Cleared voice cache: {k}")
+    
+    # Also remove from Qdrant
+    delete_voice_from_qdrant(voice, emotion)
 
 
 def list_voices() -> dict[str, list[str]]:
